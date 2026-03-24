@@ -42,7 +42,7 @@ For stable branch use `--branch=v23.11`
 
 ```bash
 apt-get -y install git
-git clone --branch=main [https://github.com/wanghaoqd/armbian-build-sunniwell-Z96a](https://github.com/wanghaoqd/armbian-build-sunniwell-Z96a)
+git clone --branch=main https://github.com/wanghaoqd/armbian-build-sunniwell-Z96a
 cd armbian-build-sunniwell-Z96
 
 # Z96A 推荐的一键编译指令 (带 Cinnamon 桌面与硬件加速)：
