@@ -568,6 +568,7 @@ driver_rtl8723DU() {
 }
 
 driver_rtl8822BS() {
+        return 0
 	# Wireless drivers for Realtek 8822BS chipsets
 
 	if linux-version compare "${version}" ge 4.4 && linux-version compare "${version}" le 5.16; then
