@@ -1,0 +1,126 @@
+name: Build Z96A Kernel (Docker enabled)
+
+# 手动触发：仓库页面 → Actions → 选中本 workflow → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: '板型（务必与你机器的 BOARD 一致）'
+        required: true
+        default: 'z96a-rk3568-usb302-laptop'
+        type: choice
+        options:
+          - z96a-rk3568-usb302-laptop
+          - z96a-rk3568-usb311-laptop
+          - z96a-rk3568-laptop
+
+jobs:
+  build:
+    # jammy runner —— 与 Armbian 要求的 Ubuntu 22.04 构建环境一致
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # GitHub runner 根分区只有 ~14G，内核编译不够用。
+      # 删掉预装的 Android SDK / .NET / Haskell 等，通常能腾出 20G+。
+      - name: 腾出磁盘空间
+        run: |
+          echo "清理前:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          echo "清理后:"; df -h /
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git bc bison flex libssl-dev make libc6-dev \
+                                  libncurses5-dev python3 rsync kmod cpio zstd
+
+      # 用我们自己的配置覆盖仓库自带的那份。
+      # 这份 = Z96A 当前正在稳定运行的内核配置 + Docker 所需选项，
+      # 相比运行中的内核只差 31 项，且全在网络/文件系统，不碰存储与显示。
+      - name: 应用自定义内核配置
+        run: |
+          TARGET=config/kernel/linux-rockchip-rk3568-z96a-legacy.config
+
+          # 仓库根目录或 custom/ 下都认，哪个方便传就传哪个
+          SRC=""
+          for c in z96a-kernel-docker.config custom/z96a-kernel-docker.config; do
+            [ -f "$c" ] && { SRC="$c"; break; }
+          done
+
+          if [ -z "$SRC" ]; then
+            echo "❌ 没找到 z96a-kernel-docker.config"
+            echo "   请把它传到仓库根目录，或 custom/ 目录下"
+            exit 1
+          fi
+
+          # 防呆：确认传上来的确实是内核配置，而不是传错了文件
+          if ! grep -q '^CONFIG_LOCALVERSION' "$SRC"; then
+            echo "❌ $SRC 看起来不像内核配置文件"
+            exit 1
+          fi
+
+          cp "$SRC" "$TARGET"
+          echo "✅ 已应用 $SRC，共 $(wc -l < "$TARGET") 行"
+          echo "   Docker 关键项抽查："
+          grep -E '^(CONFIG_MEMCG|CONFIG_NF_CONNTRACK|CONFIG_BRIDGE|CONFIG_VETH)=' "$TARGET" | sed 's/^/     /'
+
+      - name: 编译内核
+        run: |
+          # 只编内核，不编整个镜像 —— 快得多，也不需要 35G
+          ./compile.sh kernel \
+            BOARD=${{ inputs.board }} \
+            BRANCH=legacy \
+            KERNEL_CONFIGURE=no \
+            CLEAN_LEVEL="" \
+            SHARE_LOG=no \
+            EXPERT=yes
+
+      - name: 列出产物
+        run: |
+          echo "=== output/debs 内容 ==="
+          find output -name '*.deb' -exec ls -lh {} \; || true
+
+      # 在云上就先验一遍，省得下回来才发现选项被 olddefconfig 悄悄丢了
+      - name: 校验产出的内核配置
+        run: |
+          DEB=$(find output -name 'linux-image-*.deb' | head -1)
+          [ -z "$DEB" ] && { echo "❌ 没找到 linux-image deb"; exit 1; }
+
+          ARCH=$(dpkg-deb -f "$DEB" Architecture)
+          [ "$ARCH" != "arm64" ] && { echo "❌ 架构是 $ARCH，不是 arm64"; exit 1; }
+          echo "✅ 架构 = arm64"
+
+          TMP=$(mktemp -d); dpkg-deb -x "$DEB" "$TMP"
+          CFG=$(find "$TMP" -name 'config-*' | head -1)
+          echo "内核版本: $(basename "$CFG" | sed 's/^config-//')"
+
+          fail=0
+          for o in CONFIG_MEMCG CONFIG_CGROUP_PIDS CONFIG_NF_CONNTRACK CONFIG_NF_NAT \
+                   CONFIG_IP_NF_FILTER CONFIG_IP_NF_TARGET_MASQUERADE \
+                   CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_NETFILTER_XT_MATCH_CONNTRACK \
+                   CONFIG_BRIDGE CONFIG_BRIDGE_NETFILTER CONFIG_VETH CONFIG_MACVLAN \
+                   CONFIG_BPF_SYSCALL CONFIG_TUN CONFIG_EXFAT_FS CONFIG_OVERLAY_FS \
+                   CONFIG_POSIX_MQUEUE CONFIG_KVM CONFIG_VHOST_NET CONFIG_VIRTIO_PCI; do
+            v=$(grep -E "^${o}=" "$CFG" | head -1)
+            if [ -z "$v" ]; then printf "  ❌ %-38s 被丢掉了\n" "$o"; fail=$((fail+1))
+            else printf "  ✅ %-38s %s\n" "$o" "${v#*=}"; fi
+          done
+          [ $fail -gt 0 ] && { echo "❌ $fail 项没编进去，别下载这个包"; exit 1; }
+          echo "✅ Docker 所需项全部就位"
+
+      - name: 上传内核 deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: z96a-kernel-debs-${{ inputs.board }}
+          path: |
+            output/debs/linux-image-*.deb
+            output/debs/linux-dtb-*.deb
+            output/debs/linux-headers-*.deb
+          if-no-files-found: error
+          retention-days: 30
